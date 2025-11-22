@@ -1,36 +1,39 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 存放图片的目录路径
+// 注意：原来使用本地 `images/` 目录，这里改为调用 Bing 图片接口并代理图片流
 const imagesDir = path.join(__dirname, 'images');
 
-// 获取随机图片文件，根据设备类型选择不同的目录
-const getRandomImage = (userAgent) => {
-  let deviceType = 'computer'; // 默认设备类型为电脑
-  
-  // 检查 User-Agent 来识别设备类型
-  if (/mobile/i.test(userAgent)) {
-    deviceType = 'phone';  // 如果是手机
-  }
+// 从 Bing 获取壁纸列表（最近若干张），随机挑一张返回完整 URL
+const fetchJson = (url) => new Promise((resolve, reject) => {
+  https.get(url, (res) => {
+    let data = '';
+    res.on('data', chunk => data += chunk);
+    res.on('end', () => {
+      try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+    });
+  }).on('error', reject);
+});
 
-  const deviceDir = path.join(imagesDir, deviceType);
-  const files = fs.readdirSync(deviceDir);
-  const randomFile = files[Math.floor(Math.random() * files.length)];
-  return {
-    path: path.join(deviceDir, randomFile),
-    filename: randomFile
-  };
+const getRandomBingImageUrl = async () => {
+  // 请求最近 8 张壁纸（idx=0 最新, n=8）；mkt 可改为 zh-CN
+  const api = 'https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=zh-CN';
+  const json = await fetchJson(api);
+  if (!json || !json.images || !json.images.length) throw new Error('Bing API 返回空');
+  const pick = json.images[Math.floor(Math.random() * json.images.length)];
+  // 图片 URL 通常以 /... 开头，需补全域名
+  const url = pick.url.startsWith('http') ? pick.url : `https://www.bing.com${pick.url}`;
+  // 有些 url 带有参数，保留原样
+  return url;
 };
 
 // 路由：返回随机图片
 app.get('/', (req, res) => {
-  const userAgent = req.get('User-Agent');  // 获取请求头中的 User-Agent
-  const image = getRandomImage(userAgent);
-  
-  // 返回HTML页面，而不是直接返回图片
+  // 返回HTML页面，页面中的 `<img>` 会请求 `/image` 获取实际图片
   res.send(`
     <!DOCTYPE html>
     <html lang="zh">
@@ -74,16 +77,33 @@ app.get('/', (req, res) => {
 });
 
 // 新路由：直接获取图片文件
-app.get('/image', (req, res) => {
-  const userAgent = req.get('User-Agent');
-  const image = getRandomImage(userAgent);
-  
-  // 设置响应头，防止图片压缩
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Content-Type', 'image/jpeg');
-  
-  // 发送文件
-  res.sendFile(image.path);
+app.get('/image', async (req, res) => {
+  try {
+    const url = await getRandomBingImageUrl();
+
+    // 代理请求 Bing 图片并把响应头转发给客户端
+    https.get(url, (remoteRes) => {
+      // 转发内容类型与缓存控制
+      res.setHeader('Cache-Control', 'no-store');
+      if (remoteRes.headers['content-type']) {
+        res.setHeader('Content-Type', remoteRes.headers['content-type']);
+      } else {
+        res.setHeader('Content-Type', 'image/jpeg');
+      }
+      // 如果远端返回非 200，直接传回 502
+      if (remoteRes.statusCode !== 200) {
+        res.status(502).send('Failed to fetch image from Bing');
+        return;
+      }
+      remoteRes.pipe(res);
+    }).on('error', (err) => {
+      console.error('Error fetching image:', err);
+      res.status(500).send('Error fetching image');
+    });
+  } catch (e) {
+    console.error('Failed to get Bing image URL:', e);
+    res.status(500).send('Failed to get image');
+  }
 });
 
 app.listen(PORT, () => {
