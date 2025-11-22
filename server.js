@@ -27,13 +27,42 @@ const getRandomBingImageUrl = async () => {
   const pick = json.images[Math.floor(Math.random() * json.images.length)];
   // 图片 URL 通常以 /... 开头，需补全域名
   const url = pick.url.startsWith('http') ? pick.url : `https://www.bing.com${pick.url}`;
-  // 有些 url 带有参数，保留原样
+  return url;
+};
+
+// 新：根据环境变量选择图片来源，默认使用 `picsum`（每次请求都会返回不同图片）
+const getRandomImageUrl = async (options = {}) => {
+  const source = (process.env.IMAGE_SOURCE || 'picsum').toLowerCase();
+  const { w, h, seed, grayscale, blur } = options;
+  if (source === 'bing') {
+    return await getRandomBingImageUrl();
+  }
+
+  // Picsum 用法：/width/height 或 /seed/{seed}/width/height
+  // 如果没有提供尺寸，使用 1920x1080 作为默认
+  const width = parseInt(w, 10) || 1920;
+  const height = parseInt(h, 10) || 1080;
+
+  let url = '';
+  if (seed) {
+    url = `https://picsum.photos/seed/${encodeURIComponent(seed)}/${width}/${height}`;
+  } else {
+    url = `https://picsum.photos/${width}/${height}`;
+  }
+
+  const params = [];
+  if (grayscale) params.push('grayscale');
+  if (blur) params.push(`blur=${encodeURIComponent(blur)}`);
+  // 为了避免浏览器缓存导致重复图片，可在每次请求时添加随机参数或时间戳
+  params.push(`random=${Date.now()}`);
+  if (params.length) url += `?${params.join('&')}`;
+
   return url;
 };
 
 // 路由：返回随机图片
 app.get('/', (req, res) => {
-  // 返回HTML页面，页面中的 `<img>` 会请求 `/image` 获取实际图片
+  // 返回HTML页面，页面中的 `<img>` 会请求 `/image?w=...&h=...` 获取针对设备尺寸的图片
   res.send(`
     <!DOCTYPE html>
     <html lang="zh">
@@ -69,8 +98,38 @@ app.get('/', (req, res) => {
     </head>
     <body>
       <div class="image-container">
-        <img src="/image" class="full-image" alt="随机图片" />
+        <img id="randImg" src="/image" class="full-image" alt="随机图片" />
       </div>
+      <script>
+        (function () {
+          const img = document.getElementById('randImg');
+          const DPR = window.devicePixelRatio || 1;
+          const maxWidth = 3840; // 限制最大宽度，避免请求过大图片
+          const maxHeight = 2160;
+
+          function updateSrc() {
+            const w = Math.min(Math.round(window.innerWidth * DPR), maxWidth);
+            const h = Math.min(Math.round(window.innerHeight * DPR), maxHeight);
+            // 使用 timestamp 避免缓存重复
+            img.src = '/image?w=' + w + '&h=' + h + '&random=' + Date.now();
+          }
+
+          // 首次设置
+          updateSrc();
+
+          // resize 时防抖处理
+          let t = null;
+          window.addEventListener('resize', function () {
+            clearTimeout(t);
+            t = setTimeout(updateSrc, 250);
+          });
+
+          // 当页面恢复可见时也更新（例如从后台切回），以防设备像素比变化
+          document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) updateSrc();
+          });
+        })();
+      </script>
     </body>
     </html>
   `);
@@ -79,29 +138,50 @@ app.get('/', (req, res) => {
 // 新路由：直接获取图片文件
 app.get('/image', async (req, res) => {
   try {
-    const url = await getRandomBingImageUrl();
+    const url = await getRandomImageUrl();
 
-    // 代理请求 Bing 图片并把响应头转发给客户端
-    https.get(url, (remoteRes) => {
-      // 转发内容类型与缓存控制
-      res.setHeader('Cache-Control', 'no-store');
-      if (remoteRes.headers['content-type']) {
-        res.setHeader('Content-Type', remoteRes.headers['content-type']);
-      } else {
-        res.setHeader('Content-Type', 'image/jpeg');
-      }
-      // 如果远端返回非 200，直接传回 502
-      if (remoteRes.statusCode !== 200) {
-        res.status(502).send('Failed to fetch image from Bing');
-        return;
-      }
-      remoteRes.pipe(res);
-    }).on('error', (err) => {
-      console.error('Error fetching image:', err);
-      res.status(500).send('Error fetching image');
-    });
+    // 支持跟随重定向的代理函数（最大重定向 5 次）
+    const maxRedirects = 5;
+    const { URL } = require('url');
+
+    const fetchAndPipe = (targetUrl, redirectsLeft) => {
+      https.get(targetUrl, (remoteRes) => {
+        // 处理 3xx 重定向
+        if (remoteRes.statusCode >= 300 && remoteRes.statusCode < 400 && remoteRes.headers.location) {
+          if (redirectsLeft <= 0) {
+            res.status(502).send('Too many redirects');
+            return;
+          }
+          // 处理相对 location
+          const next = new URL(remoteRes.headers.location, targetUrl).toString();
+          remoteRes.resume(); // 丢弃当前响应数据
+          fetchAndPipe(next, redirectsLeft - 1);
+          return;
+        }
+
+        // 非 200 视为错误（除去已经处理的重定向）
+        if (remoteRes.statusCode !== 200) {
+          res.status(502).send('Failed to fetch image');
+          return;
+        }
+
+        // 转发 headers
+        res.setHeader('Cache-Control', 'no-store');
+        if (remoteRes.headers['content-type']) {
+          res.setHeader('Content-Type', remoteRes.headers['content-type']);
+        } else {
+          res.setHeader('Content-Type', 'image/jpeg');
+        }
+        remoteRes.pipe(res);
+      }).on('error', (err) => {
+        console.error('Error fetching image:', err);
+        res.status(500).send('Error fetching image');
+      });
+    };
+
+    fetchAndPipe(url, maxRedirects);
   } catch (e) {
-    console.error('Failed to get Bing image URL:', e);
+    console.error('Failed to get image URL:', e);
     res.status(500).send('Failed to get image');
   }
 });
